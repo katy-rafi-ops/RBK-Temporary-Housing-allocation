@@ -450,10 +450,19 @@ def match_cases(df_cases: pd.DataFrame, df_props: pd.DataFrame) -> pd.DataFrame:
 def build_folium_map(df_results: pd.DataFrame):
     try:
         import folium
-        from streamlit_folium import st_folium
     except ImportError:
-        st.warning("Install `folium` and `streamlit-folium` for the map view.")
+        st.warning("Install folium for the map view: pip install folium streamlit-folium")
         return
+    try:
+        from streamlit_folium import st_folium
+        _render_fn = "st_folium"
+    except ImportError:
+        try:
+            from streamlit_folium import folium_static
+            _render_fn = "folium_static"
+        except ImportError:
+            st.warning("Install streamlit-folium for the map view: pip install streamlit-folium")
+            return
 
     m = folium.Map(location=list(MAP_CENTRE), zoom_start=12,
                    tiles="OpenStreetMap")
@@ -528,7 +537,10 @@ def build_folium_map(df_results: pd.DataFrame):
     </div>"""
     m.get_root().html.add_child(folium.Element(legend_html))
 
-    st_folium(m, use_container_width=True, height=480, returned_objects=[])
+    if _render_fn == "st_folium":
+        st_folium(m, use_container_width=True, height=500, returned_objects=[])
+    else:
+        folium_static(m, width=None, height=500)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -797,10 +809,14 @@ if st.session_state.pipeline_run and st.session_state.results is not None:
             if val == "UNMATCHED": return "color:#A32D2D;font-weight:500"
             return ""
 
-        styled = df_display.style \
-            .applymap(highlight_priority, subset=["priority"]) \
-            .applymap(highlight_status,   subset=["status"]) \
+        # pandas >= 2.1 renamed applymap to map; support both
+        _styler = df_display.style
+        _cell_fn = "map" if hasattr(_styler, "map") else "applymap"
+        styled = (
+            getattr(_styler, _cell_fn)(highlight_priority, subset=["priority"])
+            .pipe(lambda s: getattr(s, _cell_fn)(highlight_status, subset=["status"]))
             .format({"match_score": lambda x: f"{x:.3f}" if pd.notna(x) else "—"})
+        )
 
         st.dataframe(styled, use_container_width=True, height=420)
         st.caption(f"Showing {len(df_display)} of {total} cases")
