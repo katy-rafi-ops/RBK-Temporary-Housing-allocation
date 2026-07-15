@@ -563,7 +563,8 @@ def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
 # SESSION STATE INIT
 # ══════════════════════════════════════════════════════════════════════════════
 
-for key in ["raw_clients","raw_properties","results","pipeline_run"]:
+for key in ["raw_clients","raw_properties","scored_cases","results",
+           "pipeline_run","scoring_run"]:
     if key not in st.session_state:
         st.session_state[key] = None
 
@@ -629,6 +630,113 @@ with st.sidebar:
 # MAIN AREA
 # ══════════════════════════════════════════════════════════════════════════════
 
+
+def build_audit_trail(df_scored: pd.DataFrame) -> str:
+    """Generate a single plain-text audit trail covering every case."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    SEP = "=" * 70
+    sep = "-" * 70
+    out = [SEP,
+           "  HOUSING ALLOCATION PIPELINE — PRIORITY SCORING AUDIT TRAIL",
+           SEP,
+           f"  Generated : {ts}",
+           f"  Cases     : {len(df_scored)}",
+           "  Borough   : Kingston upon Thames",
+           "  System    : Rule-based NLP priority engine v1.0",
+           SEP, ""]
+
+    for _, row in df_scored.iterrows():
+        flags_raw = str(row.get("flags", "none"))
+        flag_list = [f.replace("_", " ").title()
+                     for f in flags_raw.split("|") if f and f != "none"]
+        out += [sep,
+                f"  CASE ID      : {row.get('case_id', '')}",
+                f"  Priority     : {row.get('priority', '')}",
+                f"  Rule score   : {row.get('rule_score', 0)}/100",
+                f"  Waiting days : {row.get('waiting_days', 0)}",
+                f"  Adults       : {row.get('adults', '')}",
+                f"  Children     : {row.get('children', '')}",
+                f"  Beds required: {row.get('beds_required', '')}",
+                "",
+                "  FLAGS DETECTED:"]
+        out += [f"    • {fl}" for fl in flag_list] if flag_list else ["    • None"]
+        out += ["", "  SCORING REASONS:"]
+        for r in str(row.get("reasons", "No urgent flags")).split("; "):
+            if r.strip():
+                out.append(f"    • {r.strip()}")
+        out += ["",
+                "  BEDROOM CALCULATION:",
+                f"    {row.get('bedroom_reason', '')}",
+                "",
+                "  DATA HANDLING:",
+                "    PII redacted prior to processing. Pseudonymous tokens used.",
+                "    Processing basis: UK GDPR Article 6(1)(e) — public task.",
+                ""]
+
+    out += [SEP,
+            "  END OF AUDIT TRAIL",
+            f"  Document ref: AUDIT-{datetime.now().strftime('%Y%m%d-%H%M')}",
+            SEP]
+    return "\n".join(out)
+
+
+
+def build_audit_zip(df_scored: pd.DataFrame) -> bytes:
+    """Build a ZIP with one .txt audit file per case, plus a summary CSV."""
+    import zipfile, io
+    SEP = "=" * 60
+    sep = "-" * 60
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for _, row in df_scored.iterrows():
+            cid       = str(row.get("case_id", "CASE"))
+            flags_raw = str(row.get("flags", "none"))
+            flag_list = [f.replace("_", " ").title()
+                         for f in flags_raw.split("|") if f and f != "none"]
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            lines = [SEP,
+                     f"  CASE AUDIT RECORD — {cid}",
+                     SEP,
+                     f"  Generated    : {ts}",
+                     sep,
+                     "  PRIORITY DECISION",
+                     sep,
+                     f"  Priority class  : {row.get('priority', '')}",
+                     f"  Rule score      : {row.get('rule_score', 0)}/100",
+                     "  Score thresholds: High ≥50  Medium ≥22  Low <22",
+                     "",
+                     "  SCORING REASONS:"]
+            for r in str(row.get("reasons", "No urgent flags")).split("; "):
+                if r.strip():
+                    lines.append(f"    • {r.strip()}")
+            lines += ["", sep, "  FLAGS DETECTED (NLP)", sep]
+            lines += [f"    • {fl}" for fl in flag_list] if flag_list else ["    • None"]
+            lines += ["", sep, "  HOUSEHOLD & BEDROOM", sep,
+                      f"  Adults          : {row.get('adults', '')}",
+                      f"  Children        : {row.get('children', '')}",
+                      f"  Beds required   : {row.get('beds_required', '')}",
+                      f"  Bedroom reason  : {row.get('bedroom_reason', '')}",
+                      f"  Waiting days    : {row.get('waiting_days', '')}",
+                      "", sep, "  COMPLIANCE", sep,
+                      "  PII status      : Redacted prior to processing",
+                      "  Processing basis: UK GDPR Art 6(1)(e) — public task",
+                      "  Bedroom standard: Housing Act 1985 s.325",
+                      f"  Document ref    : {cid}-AUDIT-{datetime.now().strftime('%Y%m%d')}",
+                      SEP]
+            zf.writestr(f"audit_records/{cid}_audit.txt", "\n".join(lines))
+
+        # Summary CSV
+        summary_cols = ["case_id", "priority", "rule_score", "waiting_days",
+                        "adults", "children", "beds_required", "flags",
+                        "reasons", "bedroom_reason"]
+        df_sum = df_scored[[c for c in summary_cols if c in df_scored.columns]]
+        zf.writestr("priority_summary.csv", df_sum.to_csv(index=False))
+
+    buf.seek(0)
+    return buf.read()
+
+
 st.markdown("# 🏠 Housing Allocation Pipeline")
 st.markdown(
     "**PII redaction · NLP classification · priority scoring · "
@@ -682,96 +790,199 @@ with tab_p:
 
 st.divider()
 
-# ── Step 2: Run pipeline ───────────────────────────────────────────────────────
-st.markdown("## ⚙️ Step 2 — Run pipeline")
 
-run_col, _ = st.columns([2, 5])
-run_clicked = run_col.button(
-    "▶ Run allocation pipeline",
+# ══════════════════════════════════════════════════════════════════════════════
+# AUDIT TRAIL GENERATOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Step 2: Priority scoring ──────────────────────────────────────────────────
+st.markdown("## 🎯 Step 2 — Priority scoring & review")
+
+score_col, _ = st.columns([2, 5])
+score_clicked = score_col.button(
+    "⚡ Score cases",
     type="primary",
     use_container_width=True,
+    help="Run PII redaction, NLP flag extraction, priority scoring and bedroom calculation",
 )
 
-if run_clicked:
-    log_box   = st.empty()
-    prog_bar  = st.progress(0, text="Starting…")
-    log_lines = []
-
-    def log(msg: str, pct: int):
-        log_lines.append(f"→ {msg}")
-        log_box.markdown(
-            "\n".join(f'<div class="log-line">{l}</div>' for l in log_lines),
-            unsafe_allow_html=True,
-        )
-        prog_bar.progress(pct, text=msg)
-
-    log("Stage 1 — PII redaction", 10)
+if score_clicked:
+    prog = st.progress(0, text="Starting…")
+    prog.progress(15, text="Stage 1 — PII redaction…")
     df_redacted = redact_dataframe(df_c)
-    log(f"  ✓ {len(df_redacted)} records pseudonymised", 20)
-
-    log("Stage 2 — NLP feature extraction", 30)
-    total_flags = sum(
-        len(extract_flags(" ".join(filter(None,[
-            str(r.get("needs_description","")),
-            str(r.get("referral_notes",""))]))))
-        for r in df_redacted.to_dict("records")
-    )
-    log(f"  ✓ {len(FLAG_KEYWORDS)} flag categories · {total_flags} flags detected", 45)
-
-    log("Stage 3 — Priority scoring + bedroom calculation", 55)
+    prog.progress(45, text="Stage 2 — NLP feature extraction…")
+    time.sleep(0.2)
+    prog.progress(75, text="Stage 3 — Priority scoring + bedroom calculation…")
     df_scored = score_cases(df_redacted)
-    hi = (df_scored["priority"]=="High").sum()
-    me = (df_scored["priority"]=="Medium").sum()
-    lo = (df_scored["priority"]=="Low").sum()
-    avg_b = df_scored["beds_required"].mean()
-    log(f"  ✓ {hi} High · {me} Medium · {lo} Low · avg {avg_b:.1f} beds", 70)
-
-    log("Stage 4 — Accommodation matching", 80)
-    df_results = match_cases(df_scored, df_p)
-    matched = (df_results["status"]=="MATCHED").sum()
-    log(f"  ✓ {matched}/{len(df_scored)} cases matched · "
-        f"{len(df_scored)-matched} unmatched (escalate)", 95)
-
-    log("Pipeline complete ✓", 100)
-    prog_bar.empty()
-
-    st.session_state.results      = df_results
-    st.session_state.pipeline_run = True
-    time.sleep(0.4)
-    log_box.empty()
+    prog.progress(100, text="Scoring complete ✓")
+    time.sleep(0.3)
+    prog.empty()
+    st.session_state.scored_cases = df_scored
+    st.session_state.scoring_run  = True
+    st.session_state.results      = None
+    st.session_state.pipeline_run = False
     st.rerun()
 
-# ── Step 3: Results ────────────────────────────────────────────────────────────
+if st.session_state.scoring_run and st.session_state.scored_cases is not None:
+    df_sc = st.session_state.scored_cases
+
+    # ── Summary metrics ────────────────────────────────────────────────────
+    hi    = (df_sc["priority"] == "High").sum()
+    me    = (df_sc["priority"] == "Medium").sum()
+    lo    = (df_sc["priority"] == "Low").sum()
+    avg_b = df_sc["beds_required"].mean()
+
+    mc1, mc2, mc3, mc4 = st.columns(4)
+    mc1.metric("High priority",    hi,  delta="urgent",  delta_color="inverse")
+    mc2.metric("Medium priority",  me)
+    mc3.metric("Low priority",     lo)
+    mc4.metric("Avg beds required", f"{avg_b:.1f}")
+
+    # ── Priority bar chart (pure HTML, no extra deps) ──────────────────────
+    st.markdown("#### Priority class breakdown")
+    max_n = max(hi, me, lo, 1)
+    bars = ""
+    for label, count, colour in [
+        ("High", hi, "#E24B4A"), ("Medium", me, "#EF9F27"), ("Low", lo, "#378ADD")
+    ]:
+        pct = int(count / max_n * 100)
+        bars += (
+            f"<div style='display:flex;align-items:center;gap:10px;margin-bottom:8px'>"
+            f"<span style='width:70px;font-size:12px;font-weight:600;color:{colour}'>{label}</span>"
+            f"<div style='flex:1;background:#eee;border-radius:4px;height:22px'>"
+            f"<div style='width:{pct}%;background:{colour};height:22px;border-radius:4px'></div>"
+            f"</div><span style='font-size:13px;font-weight:600;min-width:28px'>{count}</span></div>"
+        )
+    st.markdown(f"<div style='margin:12px 0'>{bars}</div>", unsafe_allow_html=True)
+
+    # ── Scored cases table ─────────────────────────────────────────────────
+    st.markdown("#### Scored cases — review before matching")
+
+    score_tab1, score_tab2, score_tab3 = st.tabs([
+        "📋 All cases", "🔴 High priority", "⚠️ Flags detail"
+    ])
+
+    def style_scored(df_in):
+        show_cols = ["case_id", "priority", "rule_score", "waiting_days",
+                     "adults", "children", "beds_required", "flags", "reasons"]
+        df_view = df_in[[c for c in show_cols if c in df_in.columns]].copy()
+        def hp(val):
+            return {
+                "High":   "background-color:#FCEBEB;color:#A32D2D;font-weight:600",
+                "Medium": "background-color:#FAEEDA;color:#854F0B;font-weight:600",
+                "Low":    "background-color:#E6F1FB;color:#0C447C;font-weight:600",
+            }.get(val, "")
+        _s   = df_view.style
+        _cfn = "map" if hasattr(_s, "map") else "applymap"
+        return getattr(_s, _cfn)(hp, subset=["priority"])
+
+    with score_tab1:
+        st.dataframe(style_scored(df_sc), use_container_width=True, height=340)
+        st.caption(f"{len(df_sc)} cases scored")
+
+    with score_tab2:
+        df_hi = df_sc[df_sc["priority"] == "High"].sort_values(
+            "waiting_days", ascending=False)
+        if len(df_hi):
+            st.dataframe(style_scored(df_hi), use_container_width=True, height=300)
+            st.caption(f"{len(df_hi)} high priority cases — sorted by longest waiting first")
+            st.markdown(
+                '<div class="warn-box">⚠ These cases should be reviewed by a caseworker '
+                "before automated matching proceeds.</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.info("No High priority cases in this dataset.")
+
+    with score_tab3:
+        flag_cols = ["case_id", "priority", "flags", "reasons", "bedroom_reason"]
+        df_flags  = df_sc[[c for c in flag_cols if c in df_sc.columns]].copy()
+        df_flags  = df_flags[df_flags["flags"] != "none"].copy()
+        st.dataframe(df_flags, use_container_width=True, height=320)
+        st.caption(f"{len(df_flags)} cases with at least one flag detected")
+
+    # ── Audit trail downloads ──────────────────────────────────────────────
+    st.markdown("#### 📄 Audit trail")
+    st.markdown(
+        '<div class="info-box">ℹ Audit trail documents record every scoring decision, '
+        "flag, reason, and bedroom calculation for each case. "
+        "Download for caseworker review, DPIA evidence, or appeal purposes.</div>",
+        unsafe_allow_html=True,
+    )
+
+    dl1, dl2 = st.columns(2)
+    with dl1:
+        full_audit = build_audit_trail(df_sc)
+        st.download_button(
+            label="⬇ Download full audit trail (.txt)",
+            data=full_audit.encode("utf-8"),
+            file_name=f"audit_trail_{datetime.now().strftime('%Y%m%d_%H%M')}.txt",
+            mime="text/plain",
+            use_container_width=True,
+            help="Single document covering all cases — suitable for DPIA evidence",
+        )
+    with dl2:
+        zip_bytes = build_audit_zip(df_sc)
+        st.download_button(
+            label="⬇ Download per-case audit ZIP",
+            data=zip_bytes,
+            file_name=f"audit_records_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
+            mime="application/zip",
+            use_container_width=True,
+            help="One .txt file per case + summary CSV",
+        )
+
+    st.divider()
+
+    # ── Step 3: Matching ───────────────────────────────────────────────────
+    st.markdown("## 🏘️ Step 3 — Accommodation matching")
+    st.markdown(
+        '<div class="info-box">Review the priority classifications above before proceeding. '
+        "Click <b>Run matching</b> to allocate properties based on priority, "
+        "waiting time, bed fit, and availability.</div>",
+        unsafe_allow_html=True,
+    )
+
+    match_col, _ = st.columns([2, 5])
+    if match_col.button("▶ Run matching", type="primary", use_container_width=True):
+        prog2 = st.progress(0, text="Matching cases to properties…")
+        df_results = match_cases(df_sc, df_p)
+        prog2.progress(100, text="Matching complete ✓")
+        time.sleep(0.3)
+        prog2.empty()
+        st.session_state.results      = df_results
+        st.session_state.pipeline_run = True
+        st.rerun()
+
+
+# ── Step 4: Results ────────────────────────────────────────────────────────────
 if st.session_state.pipeline_run and st.session_state.results is not None:
     df_res = st.session_state.results
     st.divider()
-    st.markdown("## 📊 Step 3 — Results")
+    st.markdown("## 📊 Step 4 — Allocation results")
 
-    # Summary cards
-    total    = len(df_res)
-    matched  = (df_res["status"]=="MATCHED").sum()
-    unmatched= total - matched
-    hi_n     = (df_res["priority"]=="High").sum()
-    hi_m     = ((df_res["priority"]=="High") & (df_res["status"]=="MATCHED")).sum()
-    rate     = round(matched/total*100) if total else 0
+    total     = len(df_res)
+    matched   = (df_res["status"] == "MATCHED").sum()
+    unmatched = total - matched
+    hi_n      = (df_res["priority"] == "High").sum()
+    hi_m      = ((df_res["priority"] == "High") & (df_res["status"] == "MATCHED")).sum()
+    rate      = round(matched / total * 100) if total else 0
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total cases",    total)
-    c2.metric("Matched",        matched,   delta=f"{rate}% match rate")
-    c3.metric("Unmatched",      unmatched, delta="escalate to caseworker",
-              delta_color="inverse")
-    c4.metric("High priority",  hi_n,      delta=f"{hi_m} matched")
+    c1.metric("Total cases",   total)
+    c2.metric("Matched",       matched,   delta=f"{rate}% match rate")
+    c3.metric("Unmatched",     unmatched, delta="escalate to caseworker", delta_color="inverse")
+    c4.metric("High priority", hi_n,      delta=f"{hi_m} matched")
 
     if unmatched > 0:
         st.markdown(
             f'<div class="warn-box">⚠ <b>{unmatched} case(s)</b> could not be matched '
-            f'to any eligible property and require caseworker escalation.</div>',
+            f"to any eligible property and require caseworker escalation.</div>",
             unsafe_allow_html=True,
         )
 
     st.divider()
 
-    # Results tabs
     tab_table, tab_map = st.tabs(["📋 Allocation table", "🗺️ Map view"])
 
     with tab_table:
@@ -779,45 +990,40 @@ if st.session_state.pipeline_run and st.session_state.results is not None:
         priority_filter = filter_col.selectbox(
             "Filter by priority",
             ["All", "High", "Medium", "Low", "UNMATCHED"],
-            label_visibility="visible",
         )
-
-        display_cols = ["case_id","priority","waiting_days","beds_required",
-                        "property_id","area","match_score","status","reasons",
-                        "caseworker_action"]
+        display_cols = ["case_id", "priority", "waiting_days", "beds_required",
+                        "property_id", "area", "match_score", "status",
+                        "reasons", "caseworker_action"]
         df_display = df_res[[c for c in display_cols if c in df_res.columns]].copy()
 
         if priority_filter == "UNMATCHED":
-            df_display = df_display[df_display["status"]=="UNMATCHED"]
+            df_display = df_display[df_display["status"] == "UNMATCHED"]
         elif priority_filter != "All":
-            df_display = df_display[df_display["priority"]==priority_filter]
+            df_display = df_display[df_display["priority"] == priority_filter]
 
         if "match_score" in df_display.columns:
             df_display["match_score"] = pd.to_numeric(
-                df_display["match_score"], errors="coerce"
-            ).round(3)
+                df_display["match_score"], errors="coerce").round(3)
 
-        # Colour priority column
         def highlight_priority(val):
-            colours = {"High":"background-color:#FCEBEB;color:#A32D2D;font-weight:600",
-                       "Medium":"background-color:#FAEEDA;color:#854F0B;font-weight:600",
-                       "Low":"background-color:#E6F1FB;color:#0C447C;font-weight:600"}
-            return colours.get(val, "")
+            return {
+                "High":   "background-color:#FCEBEB;color:#A32D2D;font-weight:600",
+                "Medium": "background-color:#FAEEDA;color:#854F0B;font-weight:600",
+                "Low":    "background-color:#E6F1FB;color:#0C447C;font-weight:600",
+            }.get(val, "")
 
         def highlight_status(val):
             if val == "MATCHED":   return "color:#3B6D11;font-weight:500"
             if val == "UNMATCHED": return "color:#A32D2D;font-weight:500"
             return ""
 
-        # pandas >= 2.1 renamed applymap to map; support both
-        _styler = df_display.style
+        _styler  = df_display.style
         _cell_fn = "map" if hasattr(_styler, "map") else "applymap"
         styled = (
             getattr(_styler, _cell_fn)(highlight_priority, subset=["priority"])
             .pipe(lambda s: getattr(s, _cell_fn)(highlight_status, subset=["status"]))
             .format({"match_score": lambda x: f"{x:.3f}" if pd.notna(x) else "—"})
         )
-
         st.dataframe(styled, use_container_width=True, height=420)
         st.caption(f"Showing {len(df_display)} of {total} cases")
 
@@ -839,7 +1045,6 @@ if st.session_state.pipeline_run and st.session_state.results is not None:
 
     st.divider()
 
-    # Pipeline reference
     with st.expander("📖 Pipeline reference"):
         st.markdown("""
 | Stage | What it does | Output |
@@ -850,12 +1055,7 @@ if st.session_state.pipeline_run and st.session_state.results is not None:
 | 4 — Bedroom count | UK Bedroom Standard (Housing Act 1985) | `beds_required` |
 | 5 — Matching | Hard filters → weighted composite score | `property_id`, `match_score` |
 
-**Hard filters** (property must pass all before scoring):
-- Bedrooms ≥ beds required
-- Accessible if disability flagged
-- DV-safe location if domestic violence flagged
-- Not already allocated
+**Hard filters:** Bedrooms ≥ required · Accessible if disability · DV-safe if DV flag · Not allocated
 
-**Kingston upon Thames boundary** — all synthetic coordinates are constrained to the borough
-polygon using OS 7-parameter Helmert transformation (BNG → WGS84) + ray-casting point-in-polygon.
+**Kingston upon Thames** — coordinates constrained to borough polygon via OS Helmert BNG→WGS84.
         """)
