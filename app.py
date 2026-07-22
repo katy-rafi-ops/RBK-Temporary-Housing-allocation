@@ -30,7 +30,7 @@ warnings.filterwarnings("ignore")
 # ══════════════════════════════════════════════════════════════════════════════
 
 st.set_page_config(
-    page_title="Housing Allocation Pipeline",
+    page_title="HOMAI- Housing Optimisation and Matching Assistant Intelligence",
     page_icon="🏠",
     layout="wide",
     initial_sidebar_state="expanded",
