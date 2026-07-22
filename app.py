@@ -1,5 +1,5 @@
 """
-Housing Allocation Pipeline — Streamlit UI
+HOMAI- Housing Optimisation and Matching Assistant Intelligence — Streamlit UI
 ==========================================
 Run locally:
     pip install streamlit pandas numpy faker scikit-learn folium streamlit-folium
